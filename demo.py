@@ -145,7 +145,7 @@ SELECT
              pa.iqca_fk NOT IN (SELECT DISTINCT qc_fk FROM QcRoster) THEN 'Bhuvaneswaran'
         WHEN ls.status IN ('IQC_REVIEW','IQC_COMPLETED') AND pa.iqca_fk IS NOT NULL AND 
              pa.iqca_fk IN (SELECT DISTINCT qc_fk FROM QcRoster) THEN 'Santosh Kumar'
-        WHEN cr.rad_fk NOT IN (1505,2484,2715,2785,2231,2765) THEN '5C Admin (Ruksana)'
+        WHEN cr.rad_fk NOT IN (1505,2484,2715,2785,2231,2765) THEN 'Ruksana'
         ELSE NULL
     END AS category_manager
 
@@ -275,9 +275,16 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
     active_cases = df_demo['Active_DemoCases'].sum()
     completed_cases = df_demo['Completed_DemoCases'].sum()
     
-    within_tat_df = df_demo[df_demo['TAT_Flag'] == 'Green']
-    green_tat = len(within_tat_df)
-    red_tat = total_cases - green_tat 
+    # FIXED: Only count TAT for completed cases
+    completed_df = df_demo[df_demo['Final_Status'].isin(['Completed', 'Rework Completed'])]
+    
+    if len(completed_df) > 0:
+        within_tat_completed = completed_df[completed_df['TAT_Flag'] == 'Green']
+        green_tat = len(within_tat_completed)
+        red_tat = len(completed_df) - green_tat
+    else:
+        green_tat = 0
+        red_tat = 0
     
     # Concatenate Study_Link with Client_Name for df_demo
     if not df_demo.empty:
@@ -416,6 +423,12 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                 font-weight: bold;
                 text-align: center;
             }}
+            .tat-pending {{
+                background-color: #fff3cd;
+                color: #856404;
+                font-weight: bold;
+                text-align: center;
+            }}
             .study-link {{
                 background-color: #007bff;
                 color: white !important;
@@ -443,6 +456,12 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
             }}
             .status-completed {{ background-color: #d4edda; color: #155724; }}
             .status-pending {{ background-color: #fff3cd; color: #856404; }}
+            .tat-note {{
+                font-size: 11px;
+                color: #6c757d;
+                font-style: italic;
+                margin-top: 5px;
+            }}
         </style>
     </head>
     <body>
@@ -496,10 +515,10 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                             {"".join([f'''<tr>
                                 <td>{row["Client_Name"]}</td>
                                 <td>{row["Activated_Time"].strftime("%b %d, %H:%M")}</td>
-                                <td><span class="status-badge status-{"completed" if row["Final_Status"] == "Completed" else "pending"}">{row["Final_Status"]}</span></td>
+                                <td><span class="status-badge status-{"completed" if row["Final_Status"] in ["Completed", "Rework Completed"] else "pending"}">{row["Final_Status"]}</span></td>
                                 <td>{row["Current_Bucket"]}</td>
                                 <td>{row["modality"]}</td>
-                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" else "red"}">{row["tat_min"]}</td>
+                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" and row["Final_Status"] in ["Completed", "Rework Completed"] else "red" if row["Final_Status"] in ["Completed", "Rework Completed"] else "pending"}">{row["tat_min"] if row["Final_Status"] in ["Completed", "Rework Completed"] else "Pending"}</td>
                                 <td>{row["Clinet_source"]}</td>
                                 <td>{row["assigned_to"]}</td>
                                 <td>{row["pod_name"]}</td>
@@ -530,7 +549,7 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                                 <td>{row["Study_Created_Time"].strftime("%b %d, %H:%M")}</td>
                                 <td>{row["modality"]}</td>
                                 <td><span class="status-badge status-{"completed" if row["Final_Status"] == "COMPLETED" else "pending"}">{row["Final_Status"]}</span></td>
-                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" else "red"}">{row["tat_min"]}</td>
+                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" and row["Final_Status"] == "COMPLETED" else "red" if row["Final_Status"] == "COMPLETED" else "pending"}">{row["tat_min"] if row["Final_Status"] == "COMPLETED" else "Pending"}</td>
                                 <td>{row["Tag"]}</td>
                                 <td>{row["assigned_to"]}</td>
                                 <td>{row["pod_name"]}</td>
@@ -541,7 +560,7 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
             </div>
             <div class="footer">
                 <p><strong>5C Network</strong> | Automated Cases Report</p>
-                <p>TAT Thresholds: XRAY ≤ 60m, CT ≤ 120m, MRI ≤ 180m, NM ≤ 1440m</p>
+                <p>Demo Cases Report</p>
             </div>
         </div>
     </body>
