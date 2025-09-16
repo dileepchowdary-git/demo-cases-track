@@ -141,8 +141,10 @@ SELECT
     END AS Case_Tag,
     CASE
         WHEN cr.rad_fk IN (2231,1506,1505,2318,1504,2484,2715,2785) THEN 'Keerthana R'
-        WHEN ls.status IN ('IQC_REVIEW','IQC_COMPLETED') THEN 'Bhuvaneswaran'
-        WHEN swq.study_fk IS NOT NULL THEN 'Santosh Kumar'
+        WHEN ls.status IN ('IQC_REVIEW','IQC_COMPLETED') AND pa.iqca_fk IS NOT NULL AND 
+             pa.iqca_fk NOT IN (SELECT DISTINCT qc_fk FROM QcRoster) THEN 'Bhuvaneswaran'
+        WHEN ls.status IN ('IQC_REVIEW','IQC_COMPLETED') AND pa.iqca_fk IS NOT NULL AND 
+             pa.iqca_fk IN (SELECT DISTINCT qc_fk FROM QcRoster) THEN 'Santosh Kumar'
         WHEN cr.rad_fk NOT IN (1505,2484,2715,2785,2231,2765) THEN '5C Admin (Ruksana)'
         ELSE NULL
     END AS category_manager
@@ -159,12 +161,12 @@ LEFT JOIN ranked_studies AS rs ON sd.study_fk = rs.study_id
 LEFT JOIN latest_status AS ls ON sd.study_fk = ls.study_fk AND ls.rn = 1
 LEFT JOIN merged_parent AS mp ON s.id = mp.study_id
 LEFT JOIN correct_rad AS cr ON sd.study_fk = cr.study_fk
+LEFT JOIN preread_agent AS pa ON sd.study_fk = pa.study_fk
 LEFT JOIN studies_with_qc AS swq ON sd.study_fk = swq.study_fk
 WHERE sd.is_demo = 1
   AND sd.created_at BETWEEN now() - INTERVAL 1 DAY AND now()
 ORDER BY Final_Status, sd.created_at ASC
 """
-
 NON_DEMO_QUERY = """
 WITH ranked_studies AS (
     SELECT 
@@ -220,6 +222,7 @@ LEFT JOIN metrics.client_tat_metrics AS ctm ON sd.study_fk = ctm.study_id
 LEFT JOIN metrics.client_group AS cg ON s.client_fk = cg.client_fk
 LEFT JOIN market_analysis_tables.pods AS pods ON cg.pod_id = pods.id
 WHERE sd.is_demo = 0 
+  AND s.created_at BETWEEN now() - INTERVAL 1 DAY AND now() -- New condition to filter by last 24 hours
   AND rs.rank_within_type <= 5
   AND s.client_fk IN (SELECT client_fk FROM demo_clients)
 ORDER BY s.client_fk ASC, s.created_at ASC
@@ -275,6 +278,22 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
     within_tat_df = df_demo[df_demo['TAT_Flag'] == 'Green']
     green_tat = len(within_tat_df)
     red_tat = total_cases - green_tat 
+    
+    # Concatenate Study_Link with Client_Name for df_demo
+    if not df_demo.empty:
+        df_demo['Client_Name'] = df_demo.apply(
+            lambda row: f'<a href="{row["Study_Link"]}" target="_blank">{row["Client_Name"]}</a>',
+            axis=1
+        )
+        df_demo.drop('Study_Link', axis=1, inplace=True)
+    
+    # Concatenate Study_Link with Client_Name for df_non_demo
+    if not df_non_demo.empty:
+        df_non_demo['Client_Name'] = df_non_demo.apply(
+            lambda row: f'<a href="{row["Study_Link"]}" target="_blank">{row["Client_Name"]}</a>',
+            axis=1
+        )
+        df_non_demo.drop('Study_Link', axis=1, inplace=True)
 
     html = f"""
     <!DOCTYPE html>
@@ -433,7 +452,7 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                 <p>Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</p>
             </div>
             <div class="content">
-                <h2>Demo Cases Report (Last 4 Days)</h2>
+                <h2>Demo Cases Report (Last 24 hours)</h2>
                 <div class="summary-grid">
                     <div class="summary-card">
                         <h3>TOTAL CASES</h3>
@@ -461,11 +480,9 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                         <thead>
                             <tr>
                                 <th>Client Name</th>
-                                <th>Created</th>
                                 <th>Activated</th>
                                 <th>Status</th>
                                 <th>Current Bucket</th>
-                                <th>Link</th>
                                 <th>Modality</th>
                                 <th>TAT (min)</th>
                                 <th>Client Source</th>
@@ -478,11 +495,9 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                         <tbody>
                             {"".join([f'''<tr>
                                 <td>{row["Client_Name"]}</td>
-                                <td>{row["Study_Created_Time"].strftime("%b %d, %H:%M")}</td>
                                 <td>{row["Activated_Time"].strftime("%b %d, %H:%M")}</td>
                                 <td><span class="status-badge status-{"completed" if row["Final_Status"] == "Completed" else "pending"}">{row["Final_Status"]}</span></td>
                                 <td>{row["Current_Bucket"]}</td>
-                                <td><a href="{row["Study_Link"]}" class="study-link" target="_blank">View Case</a></td>
                                 <td>{row["modality"]}</td>
                                 <td class="tat-{"green" if row["TAT_Flag"] == "Green" else "red"}">{row["tat_min"]}</td>
                                 <td>{row["Clinet_source"]}</td>
@@ -507,7 +522,6 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                                 <th>Tag</th>
                                 <th>Assigned To</th>
                                 <th>Pod Name</th>
-                                <th>Link</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -520,7 +534,6 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                                 <td>{row["Tag"]}</td>
                                 <td>{row["assigned_to"]}</td>
                                 <td>{row["pod_name"]}</td>
-                                <td><a href="{row["Study_Link"]}" class="study-link" target="_blank">View Case</a></td>
                             </tr>''' for _, row in df_non_demo.iterrows()])}
                         </tbody>
                     </table>
