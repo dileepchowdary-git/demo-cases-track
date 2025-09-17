@@ -97,19 +97,21 @@ SELECT
     s.created_at AS Study_Created_Time,
     sd.created_at AS Activated_Time,
     1 AS Activated_DemoCases,
+    -- This column is no longer used for active case logic, but kept for summary stats
     CASE WHEN s.status NOT IN ('COMPLETED','DELETED') THEN 1 ELSE 0 END AS Active_DemoCases,
     CASE WHEN s.status = 'COMPLETED' THEN 1 ELSE 0 END AS Completed_DemoCases,
+    -- THIS IS THE CRITICAL COLUMN FOR DETERMINING THE TRUE STATUS
     CASE
         WHEN s.status = 'MERGED' THEN 
             CASE
-                WHEN mp.parent_status != 'COMPLETED' AND r.study_fk IS NOT NULL AND r.status = 'COMPLETED' THEN 'Rework Completed'
+                WHEN r.study_fk IS NOT NULL AND r.status = 'COMPLETED' THEN 'Rework Completed'
                 WHEN mp.parent_status = 'COMPLETED' THEN 'Completed'
                 WHEN mp.parent_status NOT IN ('COMPLETED','DELETED') THEN 'Pending'
                 ELSE mp.parent_status
             END
         ELSE
             CASE
-                WHEN s.status != 'COMPLETED' AND r.study_fk IS NOT NULL AND r.status = 'COMPLETED' THEN 'Rework Completed'
+                WHEN  r.study_fk IS NOT NULL AND r.status = 'COMPLETED' THEN 'Rework Completed'
                 WHEN s.status = 'COMPLETED' THEN 'Completed'
                 WHEN s.status NOT IN ('COMPLETED','DELETED') THEN 'Pending'
                 ELSE s.status
@@ -164,9 +166,10 @@ LEFT JOIN correct_rad AS cr ON sd.study_fk = cr.study_fk
 LEFT JOIN preread_agent AS pa ON sd.study_fk = pa.study_fk
 LEFT JOIN studies_with_qc AS swq ON sd.study_fk = swq.study_fk
 WHERE sd.is_demo = 1
-  AND sd.created_at BETWEEN now() - INTERVAL 1 DAY AND now()
+  AND sd.created_at BETWEEN now() - INTERVAL 20 DAY AND now()
 ORDER BY Final_Status, sd.created_at ASC
 """
+
 NON_DEMO_QUERY = """
 WITH ranked_studies AS (
     SELECT 
@@ -186,7 +189,7 @@ demo_clients AS (
     FROM Studies AS s
     INNER JOIN StudyDetails AS sd ON sd.study_fk = s.id
     WHERE sd.is_demo = 1
-      AND sd.created_at BETWEEN now() - INTERVAL 1 DAY AND now()
+      AND sd.created_at BETWEEN now() - INTERVAL 20 DAY AND now()
 )
 SELECT 
     c.client_name AS Client_Name,
@@ -222,11 +225,12 @@ LEFT JOIN metrics.client_tat_metrics AS ctm ON sd.study_fk = ctm.study_id
 LEFT JOIN metrics.client_group AS cg ON s.client_fk = cg.client_fk
 LEFT JOIN market_analysis_tables.pods AS pods ON cg.pod_id = pods.id
 WHERE sd.is_demo = 0 
-  AND s.created_at BETWEEN now() - INTERVAL 1 DAY AND now() -- New condition to filter by last 24 hours
+  AND s.created_at BETWEEN now() - INTERVAL 20 DAY AND now() -- New condition to filter by last 24 hours
   AND rs.rank_within_type <= 5
   AND s.client_fk IN (SELECT client_fk FROM demo_clients)
 ORDER BY s.client_fk ASC, s.created_at ASC
 """
+
 
 # ---------------- FUNCTIONS ----------------
 def execute_query_and_send_email():
@@ -256,9 +260,35 @@ def execute_query_and_send_email():
             print("No data found.")
             return
 
+        # A case is active if its Final_Status is not 'Completed', 'Rework Completed', or 'DELETED'.
+        if not df_demo.empty:
+            active_demo_cases = df_demo[~df_demo['Final_Status'].isin(['Completed', 'Rework Completed', 'DELETED'])]
+        else:
+            active_demo_cases = pd.DataFrame()
+        
+        if not df_non_demo.empty:
+            active_non_demo_cases = df_non_demo[~df_non_demo['Final_Status'].isin(['COMPLETED', 'DELETED'])]
+        else:
+            active_non_demo_cases = pd.DataFrame()
+        
+        # Check for TAT breach cases (completed demo cases that exceeded TAT)
+        tat_breach_demo = df_demo[(df_demo['Final_Status'].isin(['Completed', 'Rework Completed'])) & (df_demo['TAT_Flag'] == 'Red')] if not df_demo.empty else pd.DataFrame()
+        
+        # Create a separate DataFrame for 'Rework Completed' cases
+        rework_completed_demo = df_demo[df_demo['Final_Status'] == 'Rework Completed'] if not df_demo.empty else pd.DataFrame()
+
+        # The email will ONLY be sent if there are active cases.
+        if active_demo_cases.empty and active_non_demo_cases.empty:
+            print("No active cases found. Email will not be sent.")
+            return
+
+        print(f"Found {len(active_demo_cases)} active demo cases, {len(active_non_demo_cases)} active non-demo cases")
+        print(f"Found {len(tat_breach_demo)} TAT breach demo cases")
+        print(f"Found {len(rework_completed_demo)} rework completed demo cases")
+
         # Convert to HTML tables
         print("Creating HTML table...")
-        html_content = create_html_table(df_demo, df_non_demo)
+        html_content = create_html_table(df_demo, df_non_demo, active_demo_cases, active_non_demo_cases, tat_breach_demo, rework_completed_demo)
 
         # Send email to multiple recipients
         print("Sending email...")
@@ -268,15 +298,19 @@ def execute_query_and_send_email():
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         raise
-
-def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
+# CORRECTED FUNCTION SIGNATURE: Added rework_completed_demo argument
+def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame, active_demo_cases: pd.DataFrame, active_non_demo_cases: pd.DataFrame, tat_breach_demo: pd.DataFrame, rework_completed_demo: pd.DataFrame) -> str:
     """Convert DataFrames to a professional and compact HTML email with separate boxes and a clean table."""
-    total_cases = len(df_demo)
-    active_cases = df_demo['Active_DemoCases'].sum()
-    completed_cases = df_demo['Completed_DemoCases'].sum()
+    # Summary stats are calculated on ALL demo data from the query
     
-    # FIXED: Only count TAT for completed cases
+    # Exclude 'DELETED' cases from the total count
+    completed_and_active_df = df_demo[df_demo['Final_Status'] != 'DELETED']
+    total_cases = len(completed_and_active_df)
+    
+    active_cases = len(active_demo_cases)
+    
     completed_df = df_demo[df_demo['Final_Status'].isin(['Completed', 'Rework Completed'])]
+    completed_cases = len(completed_df)
     
     if len(completed_df) > 0:
         within_tat_completed = completed_df[completed_df['TAT_Flag'] == 'Green']
@@ -286,29 +320,29 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
         green_tat = 0
         red_tat = 0
     
-    # Concatenate Study_Link with Client_Name for df_demo
-    if not df_demo.empty:
-        df_demo['Client_Name'] = df_demo.apply(
-            lambda row: f'<a href="{row["Study_Link"]}" target="_blank">{row["Client_Name"]}</a>',
-            axis=1
-        )
-        df_demo.drop('Study_Link', axis=1, inplace=True)
+    # Prepare data for HTML tables
+    demo_table_data = active_demo_cases.copy()
+    non_demo_table_data = active_non_demo_cases.copy()
+    tat_breach_demo_data = tat_breach_demo.copy()
+    rework_table_data = rework_completed_demo.copy()
     
-    # Concatenate Study_Link with Client_Name for df_non_demo
-    if not df_non_demo.empty:
-        df_non_demo['Client_Name'] = df_non_demo.apply(
-            lambda row: f'<a href="{row["Study_Link"]}" target="_blank">{row["Client_Name"]}</a>',
-            axis=1
-        )
-        df_non_demo.drop('Study_Link', axis=1, inplace=True)
+    # Apply hyperlink formatting to all dataframes
+    for df in [demo_table_data, non_demo_table_data, tat_breach_demo_data, rework_table_data]:
+        if not df.empty and 'Study_Link' in df.columns:
+            df['Client_Name'] = df.apply(
+                lambda row: f'<a href="{row["Study_Link"]}" target="_blank">{row["Client_Name"]}</a>',
+                axis=1
+            )
+            df.drop('Study_Link', axis=1, inplace=True)
 
+    # --- HTML Generation ---
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Cases Report</title>
+        <title>Active Cases Report</title>
         <style>
             body {{
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -375,10 +409,11 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
             }}
             .green-number {{ color: #28a745 !important; }}
             .red-number {{ color: #dc3545 !important; }}
+            .orange-number {{ color: #fd7e14 !important; }}
             
             h2 {{
                 font-size: 18px;
-                margin-top: 15px;
+                margin-top: 25px;
                 margin-bottom: 10px;
                 color: #3f51b5;
                 border-bottom: 2px solid #e0e6ed;
@@ -411,15 +446,15 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
             tbody tr:nth-child(even) {{ background-color: #fdfdfd; }}
             tbody tr:hover {{ background-color: #f1f3f5; }}
             
-            .tat-green {{
-                background-color: #e6f7e9;
-                color: #1e7e34;
-                font-weight: bold;
-                text-align: center;
-            }}
             .tat-red {{
                 background-color: #ffe6e8;
                 color: #b32d3a;
+                font-weight: bold;
+                text-align: center;
+            }}
+            .tat-green {{
+                background-color: #d4edda;
+                color: #155724;
                 font-weight: bold;
                 text-align: center;
             }}
@@ -428,16 +463,6 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                 color: #856404;
                 font-weight: bold;
                 text-align: center;
-            }}
-            .study-link {{
-                background-color: #007bff;
-                color: white !important;
-                padding: 5px 10px;
-                border-radius: 4px;
-                text-decoration: none;
-                font-size: 11px;
-                font-weight: 500;
-                display: inline-block;
             }}
             .footer {{
                 padding: 15px;
@@ -456,11 +481,12 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
             }}
             .status-completed {{ background-color: #d4edda; color: #155724; }}
             .status-pending {{ background-color: #fff3cd; color: #856404; }}
-            .tat-note {{
-                font-size: 11px;
+            .status-rework {{ background-color: #d6d8db; color: #343a40; }}
+            .no-data {{
+                text-align: center;
+                padding: 20px;
                 color: #6c757d;
                 font-style: italic;
-                margin-top: 5px;
             }}
         </style>
     </head>
@@ -471,15 +497,15 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                 <p>Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</p>
             </div>
             <div class="content">
-                <h2>Demo Cases Report (Last 24 hours)</h2>
+                <h2>📊 Summary - All Cases (Last 10 Days)</h2>
                 <div class="summary-grid">
                     <div class="summary-card">
-                        <h3>TOTAL CASES</h3>
+                        <h3>TOTAL DEMO</h3>
                         <div class="number">{total_cases}</div>
                     </div>
                     <div class="summary-card">
-                        <h3>ACTIVE CASES</h3>
-                        <div class="number">{active_cases}</div>
+                        <h3>ACTIVE DEMO</h3>
+                        <div class="number orange-number">{active_cases}</div>
                     </div>
                     <div class="summary-card">
                         <h3>COMPLETED</h3>
@@ -494,6 +520,11 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                         <div class="number red-number">{red_tat}</div>
                     </div>
                 </div>
+                
+                <h2>Active Demo Cases</h2>"""
+    
+    if not demo_table_data.empty:
+        html += f"""
                 <div class="table-container">
                     <table>
                         <thead>
@@ -515,20 +546,26 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                             {"".join([f'''<tr>
                                 <td>{row["Client_Name"]}</td>
                                 <td>{row["Activated_Time"].strftime("%b %d, %H:%M")}</td>
-                                <td><span class="status-badge status-{"completed" if row["Final_Status"] in ["Completed", "Rework Completed"] else "pending"}">{row["Final_Status"]}</span></td>
+                                <td><span class="status-badge status-pending">{row["Final_Status"]}</span></td>
                                 <td>{row["Current_Bucket"]}</td>
                                 <td>{row["modality"]}</td>
-                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" and row["Final_Status"] in ["Completed", "Rework Completed"] else "red" if row["Final_Status"] in ["Completed", "Rework Completed"] else "pending"}">{row["tat_min"] if row["Final_Status"] in ["Completed", "Rework Completed"] else "Pending"}</td>
+                                <td class="tat-pending">Pending</td>
                                 <td>{row["Clinet_source"]}</td>
                                 <td>{row["assigned_to"]}</td>
                                 <td>{row["pod_name"]}</td>
                                 <td>{row["Case_Tag"]}</td>
                                 <td>{row["category_manager"]}</td>
-                            </tr>''' for _, row in df_demo.iterrows()])}
+                            </tr>''' for _, row in demo_table_data.iterrows()])}
                         </tbody>
                     </table>
-                </div>
-                <h2>First 5 Real Cases</h2>
+                </div>"""
+    else:
+        html += '<div class="no-data">No active demo cases found.</div>'
+    
+    html += '<h2>Active First 5 Real Cases</h2>'
+    
+    if not non_demo_table_data.empty:
+        html += f"""
                 <div class="table-container">
                     <table>
                         <thead>
@@ -548,19 +585,105 @@ def create_html_table(df_demo: pd.DataFrame, df_non_demo: pd.DataFrame) -> str:
                                 <td>{row["Client_Name"]}</td>
                                 <td>{row["Study_Created_Time"].strftime("%b %d, %H:%M")}</td>
                                 <td>{row["modality"]}</td>
-                                <td><span class="status-badge status-{"completed" if row["Final_Status"] == "COMPLETED" else "pending"}">{row["Final_Status"]}</span></td>
-                                <td class="tat-{"green" if row["TAT_Flag"] == "Green" and row["Final_Status"] == "COMPLETED" else "red" if row["Final_Status"] == "COMPLETED" else "pending"}">{row["tat_min"] if row["Final_Status"] == "COMPLETED" else "Pending"}</td>
+                                <td><span class="status-badge status-pending">{row["Final_Status"]}</span></td>
+                                <td class="tat-pending">Pending</td>
                                 <td>{row["Tag"]}</td>
                                 <td>{row["assigned_to"]}</td>
                                 <td>{row["pod_name"]}</td>
-                            </tr>''' for _, row in df_non_demo.iterrows()])}
+                            </tr>''' for _, row in non_demo_table_data.iterrows()])}
                         </tbody>
                     </table>
-                </div>
+                </div>"""
+    else:
+        html += '<div class="no-data">No active real cases found.</div>'
+
+    html += '<h2>🔧 Rework Completed Demo Cases</h2>'
+    
+    if not rework_table_data.empty:
+        html += f"""
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Client Name</th>
+                                <th>Activated</th>
+                                <th>Status</th>
+                                <th>Current Bucket</th>
+                                <th>Modality</th>
+                                <th>TAT (min)</th>
+                                <th>Client Source</th>
+                                <th>Assigned To</th>
+                                <th>Pod Name</th>
+                                <th>Case Tag</th>
+                                <th>Category Manager</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {"".join([f'''<tr>
+                                <td>{row["Client_Name"]}</td>
+                                <td>{row["Activated_Time"].strftime("%b %d, %H:%M")}</td>
+                                <td><span class="status-badge status-rework">{row["Final_Status"]}</span></td>
+                                <td>{row["Current_Bucket"]}</td>
+                                <td>{row["modality"]}</td>
+                                <td class="{'tat-red' if row['TAT_Flag'] == 'Red' else 'tat-green'}">{row["tat_min"]}</td>
+                                <td>{row["Clinet_source"]}</td>
+                                <td>{row["assigned_to"]}</td>
+                                <td>{row["pod_name"]}</td>
+                                <td>{row["Case_Tag"]}</td>
+                                <td>{row["category_manager"]}</td>
+                            </tr>''' for _, row in rework_table_data.iterrows()])}
+                        </tbody>
+                    </table>
+                </div>"""
+    else:
+        html += '<div class="no-data">No rework completed demo cases found.</div>'
+
+    html += '<h2>⚠️ TAT Breach Demo Cases (Completed)</h2>'
+    
+    if not tat_breach_demo_data.empty:
+        html += f"""
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Client Name</th>
+                                <th>Activated</th>
+                                <th>Status</th>
+                                <th>Current Bucket</th>
+                                <th>Modality</th>
+                                <th>TAT (min)</th>
+                                <th>Client Source</th>
+                                <th>Assigned To</th>
+                                <th>Pod Name</th>
+                                <th>Case Tag</th>
+                                <th>Category Manager</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {"".join([f'''<tr>
+                                <td>{row["Client_Name"]}</td>
+                                <td>{row["Activated_Time"].strftime("%b %d, %H:%M")}</td>
+                                <td><span class="status-badge status-completed">{row["Final_Status"]}</span></td>
+                                <td>{row["Current_Bucket"]}</td>
+                                <td>{row["modality"]}</td>
+                                <td class="tat-red">{row["tat_min"]}</td>
+                                <td>{row["Clinet_source"]}</td>
+                                <td>{row["assigned_to"]}</td>
+                                <td>{row["pod_name"]}</td>
+                                <td>{row["Case_Tag"]}</td>
+                                <td>{row["category_manager"]}</td>
+                            </tr>''' for _, row in tat_breach_demo_data.iterrows()])}
+                        </tbody>
+                    </table>
+                </div>"""
+    else:
+        html += '<div class="no-data">No TAT breach demo cases found.</div>'
+
+    html += f"""
             </div>
             <div class="footer">
-                <p><strong>5C Network</strong> | Automated Cases Report</p>
-                <p>Demo Cases Report</p>
+                <p><strong>5C Network</strong> | Active Cases & TAT Breach Alert System</p>
+                <p>This email is sent when there are active cases or TAT breaches requiring attention</p>
             </div>
         </div>
     </body>
